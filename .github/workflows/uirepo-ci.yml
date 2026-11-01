@@ -1,0 +1,204 @@
+name: uirepo-ci
+
+on:
+  push:
+    branches: ["ci/**"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: uirepo-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PRIVATE_REPO: PRISMA-USER-INTERFACE-FRAMEWORK/UIRepo
+  UIREPO_PUBLIC_CI: '1'
+  XMAKE_VERSION: '3.1.2'
+
+jobs:
+  native-core:
+    name: Native core / portable regressions
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: xmake-io/github-action-setup-xmake@3a1a5dddfc7fa625d9a698738334bf55655a861a # v1
+        with:
+          xmake-version: ${{ env.XMAKE_VERSION }}
+
+      - name: Validate and run the portable regressions with xmake
+        run: bash scripts/ci-native-core.sh
+
+  windows-cross:
+    name: Windows cross-build / clang-cl + xwin
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: xmake-io/github-action-setup-xmake@3a1a5dddfc7fa625d9a698738334bf55655a861a # v1
+        with:
+          xmake-version: ${{ env.XMAKE_VERSION }}
+
+      - name: Choose the xwin directory
+        run: echo "XWIN_ROOT=$HOME/xwin" >> "$GITHUB_ENV"
+
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ~/xwin
+          key: xwin-${{ runner.os }}-${{ hashFiles('scripts/ci-hosted-toolchain.sh') }}
+
+      - name: Provision clang-cl and xwin
+        run: bash scripts/ci-hosted-toolchain.sh
+
+      - name: Cross-build the portable core, the D3D11 renderer and the SDK sample
+        run: bash scripts/ci-xwin-build.sh
+
+  fo4-dll:
+    name: FO4 DLL / clang-cl + xwin
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: xmake-io/github-action-setup-xmake@3a1a5dddfc7fa625d9a698738334bf55655a861a # v1
+        with:
+          xmake-version: ${{ env.XMAKE_VERSION }}
+
+      - name: Choose the xwin directory
+        run: echo "XWIN_ROOT=$HOME/xwin" >> "$GITHUB_ENV"
+
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ~/xwin
+          key: xwin-${{ runner.os }}-${{ hashFiles('scripts/ci-hosted-toolchain.sh') }}
+
+      - name: Provision clang-cl and xwin
+        run: bash scripts/ci-hosted-toolchain.sh
+
+      - name: Build UIRepo_F4.dll against the pinned commonlibf4-nomad
+        run: bash scripts/ci-fo4-dll-build.sh
+
+  windows-stage0:
+    name: Native Windows / MSVC + CommonLibF4 + D3D11 WARP
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: xmake-io/github-action-setup-xmake@3a1a5dddfc7fa625d9a698738334bf55655a861a # v1
+        with:
+          xmake-version: ${{ env.XMAKE_VERSION }}
+
+      - name: Validate the Stage 0 PowerShell acceptance scripts
+        shell: cmd
+        run: powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\scripts\ci-validate-stage0-powershell.ps1
+
+      - name: Build and execute Stage 0 on native Windows
+        shell: cmd
+        run: powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\scripts\ci-windows-stage0.ps1
+
+  report:
+    name: Report to the private commit
+    needs: [native-core, windows-cross, fo4-dll, windows-stage0]
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    environment: ci
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Post the result as the public-ci status on the private commit
+        env:
+          GH_TOKEN: ${{ secrets.PUBLIC_CI_TOKEN }}
+          NEEDS: ${{ toJSON(needs) }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          [ -n "$GH_TOKEN" ] || { echo "::error::PUBLIC_CI_TOKEN is not available to this run"; exit 1; }
+          source=$(git log -1 --format=%B | sed -n 's/^Source-Commit: \([0-9a-f]\{40\}\)$/\1/p')
+          [ -n "$source" ] || { echo "::error::no Source-Commit trailer"; exit 1; }
+          failed=$(jq -r 'to_entries | map(select(.value.result != "success") | .key) | join(", ")' <<<"$NEEDS")
+          if [ -z "$failed" ]; then state=success; description="all jobs passed"; else state=failure; description="failed: $failed"; fi
+          gh api "repos/$PRIVATE_REPO/statuses/$source" -f state="$state" -f context="public-ci" \
+            -f target_url="$RUN_URL" -f description="${description:0:140}" >/dev/null
+          echo "$state posted to $PRIVATE_REPO@$source ($description)"
+
+  delete-branch:
+    name: Delete the passing public branch
+    needs: [native-core, windows-cross, fo4-dll, windows-stage0, report]
+    if: success()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    timeout-minutes: 5
+    steps:
+      - name: Delete the branch through the refs API
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+          TESTED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$BRANCH" =~ ^ci/[A-Za-z0-9._-]+$ ]] || { echo "::error::refusing to delete unexpected branch name"; exit 1; }
+          default=$(gh api "repos/$REPO" --jq .default_branch)
+          if [ "$default" = "$BRANCH" ]; then
+            echo "::error::$BRANCH is the default branch of $REPO and GitHub cannot delete it; seed a main branch and make it the default (docs/public-ci.md)"
+            exit 1
+          fi
+          tip=$(gh api "repos/$REPO/git/ref/heads/$BRANCH" --jq .object.sha 2>/dev/null || true)
+          if [ "$tip" != "$TESTED_SHA" ]; then
+            echo "$BRANCH is at ${tip:-no commit}, not the tested $TESTED_SHA; not deleting"
+            exit 0
+          fi
+          if out=$(gh api -X DELETE "repos/$REPO/git/refs/heads/$BRANCH" 2>&1); then
+            echo "deleted $BRANCH"
+          elif grep -q 'Reference does not exist' <<<"$out"; then
+            echo "$BRANCH is already gone"
+          else
+            echo "$out"
+            exit 1
+          fi
+
+  cleanup:
+    name: Delete superseded and orphaned runs
+    needs: [report, delete-branch]
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - name: Delete completed runs that are superseded or whose branch is gone
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          live=" $(gh api "repos/$REPO/branches" --paginate --jq '.[].name' | tr '\n' ' ') "
+          declare -A newest=(["$BRANCH"]=1)
+          gh api "repos/$REPO/actions/runs?status=completed&per_page=100" --paginate \
+            --jq '.workflow_runs[] | select(.path == ".github/workflows/uirepo-ci.yml") | "\(.id) \(.head_branch)"' > runs.txt
+          while read -r id branch; do
+            if [[ "$live" == *" $branch "* && -z "${newest[$branch]:-}" ]]; then
+              newest[$branch]=1
+              continue
+            fi
+            gh api -X DELETE "repos/$REPO/actions/runs/$id"
+            echo "deleted run $id ($branch)"
+          done < runs.txt

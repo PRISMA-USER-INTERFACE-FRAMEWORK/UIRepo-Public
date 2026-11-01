@@ -1,0 +1,7 @@
+target("uirepo_retained_animation_tests")
+    set_kind("binary")
+    set_default(false)
+    add_deps("uirepo_core")
+    add_includedirs("../native/cpp/include")
+    add_files("../native/cpp/tests/RetainedAnimationTests.cpp")
+target_end()

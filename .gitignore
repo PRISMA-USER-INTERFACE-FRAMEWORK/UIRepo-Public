@@ -1,0 +1,9 @@
+/build/
+/build-*/
+/.xmake/
+/lib/commonlibf4/
+/.ci-uirepo-xm.bat
+*.user
+*.suo
+*.VC.db
+*.bmp
